@@ -84,9 +84,10 @@ def agent_loop(messages: list) -> str:
         )
         message = response.choices[0].message
 
-        assistant_message = {"role": "assistant"}
-        if message.content:
-            assistant_message["content"] = message.content
+        assistant_message = {
+            "role": "assistant",
+            "content": message.content or "",
+        }
         if message.tool_calls:
             assistant_message["tool_calls"] = [
                 {
@@ -104,6 +105,7 @@ def agent_loop(messages: list) -> str:
         if not message.tool_calls:
             return message.content or ""
 
+        tool_messages = []
         for tool_call in message.tool_calls:
             try:
                 args = json.loads(tool_call.function.arguments or "{}")
@@ -115,11 +117,12 @@ def agent_loop(messages: list) -> str:
                 output = run_bash(command)
                 print(output[:200])
 
-            messages.append({
+            tool_messages.append({
                 "role": "tool",
                 "tool_call_id": tool_call.id,
                 "content": output,
             })
+        messages.extend(tool_messages)
 
 
 if __name__ == "__main__":
