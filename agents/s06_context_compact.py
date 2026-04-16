@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # Harness: compression -- clean memory for infinite sessions.
 """
+mm
 s06_context_compact.py - Compact
 
 Three-layer compression pipeline so the agent can work forever:
