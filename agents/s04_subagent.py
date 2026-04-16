@@ -23,21 +23,25 @@ context, sharing the filesystem, then returns only a summary to the parent.
 Key insight: "Process isolation gives context isolation for free."
 """
 
+import json
 import os
+import re
 import subprocess
 from pathlib import Path
+from typing import Any
 
-from anthropic import Anthropic
 from dotenv import load_dotenv
+from openai import OpenAI
 
 load_dotenv(override=True)
 
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+client = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY", "not-needed"),
+    base_url=os.getenv("OPENAI_BASE_URL") or os.getenv("ANTHROPIC_BASE_URL"),
+)
+MODEL = os.environ["MODEL_ID"]
 
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks."
 SUBAGENT_SYSTEM = f"You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."
@@ -99,16 +103,121 @@ TOOL_HANDLERS = {
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
 }
 
+def parse_tool_arguments(arguments: str | None) -> tuple[dict[str, Any] | None, str | None]:
+    raw_arguments = arguments or "{}"
+    try:
+        parsed = json.loads(raw_arguments)
+    except json.JSONDecodeError as exc:
+        return None, f"Error: Invalid tool arguments: {exc}"
+    if not isinstance(parsed, dict):
+        return None, "Error: Tool arguments must decode to a JSON object"
+    return parsed, None
+
+
+def compress_tool_output(tool_name: str, args: dict[str, Any], output: str) -> str:
+    if output.startswith("Error:"):
+        return output[:2000]
+
+    if tool_name == "read_file":
+        path = args.get("path", "<unknown>")
+        lines = output.splitlines()
+        summary: list[str] = [f"Read {path} ({len(lines)} lines)."]
+
+        docstring_line = ""
+        for line in lines[:40]:
+            stripped = line.strip().strip("\"'")
+            if stripped and not stripped.startswith("#"):
+                docstring_line = stripped
+                break
+        if docstring_line:
+            summary.append(f"Top text: {docstring_line[:160]}")
+
+        definitions = []
+        for line in lines:
+            match = re.match(r"^\s*(def|class)\s+([A-Za-z_][A-Za-z0-9_]*)", line)
+            if match:
+                definitions.append(f"{match.group(1)} {match.group(2)}")
+            if len(definitions) >= 20:
+                break
+        if definitions:
+            summary.append("Symbols: " + ", ".join(definitions))
+
+        preview = [line for line in lines[:20] if line.strip()]
+        if preview:
+            summary.append("Preview:\n" + "\n".join(preview[:12]))
+        return "\n".join(summary)[:2500]
+
+    if tool_name == "bash":
+        command = args.get("command", "")
+        lines = output.splitlines()
+        if "rg --files" in command or "find " in command:
+            preview = "\n".join(lines[:80])
+            return f"Command `{command}` returned {len(lines)} lines.\n{preview}"[:2500]
+        return f"Command `{command}` output:\n{output[:2200]}"
+
+    return output[:2000]
+
+
 # Child gets all base tools except task (no recursive spawning)
 CHILD_TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Run a shell command.",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read file contents.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write content to file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Replace exact text in file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_text": {"type": "string"},
+                    "new_text": {"type": "string"},
+                },
+                "required": ["path", "old_text", "new_text"],
+            },
+        },
+    },
 ]
 
 
@@ -116,53 +225,156 @@ CHILD_TOOLS = [
 def run_subagent(prompt: str) -> str:
     sub_messages = [{"role": "user", "content": prompt}]  # fresh context
     for _ in range(30):  # safety limit
-        response = client.messages.create(
-            model=MODEL, system=SUBAGENT_SYSTEM, messages=sub_messages,
-            tools=CHILD_TOOLS, max_tokens=8000,
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "system", "content": SUBAGENT_SYSTEM}, *sub_messages],
+            tools=CHILD_TOOLS,
+            tool_choice="auto",
         )
-        sub_messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
-            break
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)[:50000]})
-        sub_messages.append({"role": "user", "content": results})
+        message = response.choices[0].message
+
+        assistant_message = {
+            "role": "assistant",
+            "content": message.content or "",
+        }
+        if message.tool_calls:
+            sanitized_tool_calls = []
+            invalid_tool_calls = []
+            for tool_call in message.tool_calls:
+                args, error = parse_tool_arguments(tool_call.function.arguments)
+                if error:
+                    invalid_tool_calls.append(f"{tool_call.function.name}: {error}")
+                    continue
+                sanitized_tool_calls.append(
+                    {
+                        "id": tool_call.id,
+                        "type": "function",
+                        "function": {
+                            "name": tool_call.function.name,
+                            "arguments": json.dumps(args, ensure_ascii=True),
+                        },
+                    }
+                )
+            if sanitized_tool_calls:
+                assistant_message["tool_calls"] = sanitized_tool_calls
+            if invalid_tool_calls:
+                error_text = "\n".join(invalid_tool_calls)
+                assistant_message["content"] = (
+                    (assistant_message["content"] + "\n") if assistant_message["content"] else ""
+                ) + error_text
+        sub_messages.append(assistant_message)
+
+        if not message.tool_calls:
+            return message.content or "(no summary)"
+
+        tool_messages = []
+        for tool_call in message.tool_calls:
+            args, error = parse_tool_arguments(tool_call.function.arguments)
+            if error:
+                output = error
+            else:
+                handler = TOOL_HANDLERS.get(tool_call.function.name)
+                output = handler(**args) if handler else f"Error: Unknown tool {tool_call.function.name}"
+            tool_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": compress_tool_output(tool_call.function.name, args or {}, str(output)),
+                }
+            )
+        sub_messages.extend(tool_messages)
     # Only the final text returns to the parent -- child context is discarded
-    return "".join(b.text for b in response.content if hasattr(b, "text")) or "(no summary)"
+    return "(subagent stopped after 30 steps)"
 
 
 # -- Parent tools: base tools + task dispatcher --
 PARENT_TOOLS = CHILD_TOOLS + [
-    {"name": "task", "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
-     "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}, "description": {"type": "string", "description": "Short description of the task"}}, "required": ["prompt"]}},
+    {
+        "type": "function",
+        "function": {
+            "name": "task",
+            "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string"},
+                    "description": {
+                        "type": "string",
+                        "description": "Short description of the task",
+                    },
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
 ]
 
 
-def agent_loop(messages: list):
+def agent_loop(messages: list) -> str:
     while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=PARENT_TOOLS, max_tokens=8000,
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "system", "content": SYSTEM}, *messages],
+            tools=PARENT_TOOLS,
+            tool_choice="auto",
         )
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
-            return
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                if block.name == "task":
-                    desc = block.input.get("description", "subtask")
-                    print(f"> task ({desc}): {block.input['prompt'][:80]}")
-                    output = run_subagent(block.input["prompt"])
-                else:
-                    handler = TOOL_HANDLERS.get(block.name)
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                print(f"  {str(output)[:200]}")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
-        messages.append({"role": "user", "content": results})
+        message = response.choices[0].message
+
+        assistant_message = {
+            "role": "assistant",
+            "content": message.content or "",
+        }
+        if message.tool_calls:
+            sanitized_tool_calls = []
+            invalid_tool_calls = []
+            for tool_call in message.tool_calls:
+                args, error = parse_tool_arguments(tool_call.function.arguments)
+                if error:
+                    invalid_tool_calls.append(f"{tool_call.function.name}: {error}")
+                    continue
+                sanitized_tool_calls.append(
+                    {
+                        "id": tool_call.id,
+                        "type": "function",
+                        "function": {
+                            "name": tool_call.function.name,
+                            "arguments": json.dumps(args, ensure_ascii=True),
+                        },
+                    }
+                )
+            if sanitized_tool_calls:
+                assistant_message["tool_calls"] = sanitized_tool_calls
+            if invalid_tool_calls:
+                error_text = "\n".join(invalid_tool_calls)
+                assistant_message["content"] = (
+                    (assistant_message["content"] + "\n") if assistant_message["content"] else ""
+                ) + error_text
+        messages.append(assistant_message)
+
+        if not message.tool_calls:
+            return message.content or ""
+
+        tool_messages = []
+        for tool_call in message.tool_calls:
+            args, error = parse_tool_arguments(tool_call.function.arguments)
+            if error:
+                output = error
+            elif tool_call.function.name == "task":
+                desc = args.get("description", "subtask")
+                print(f"> task ({desc}): {args['prompt'][:80]}")
+                output = run_subagent(args["prompt"])
+            else:
+                handler = TOOL_HANDLERS.get(tool_call.function.name)
+                output = handler(**args) if handler else f"Error: Unknown tool {tool_call.function.name}"
+            print(f"  {str(output)[:200]}")
+            tool_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": str(output),
+                }
+            )
+        messages.extend(tool_messages)
 
 
 if __name__ == "__main__":

@@ -25,15 +25,22 @@ from pathlib import Path
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
+from openai import OpenAI
+import json
 
 load_dotenv(override=True)
 
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+client = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY", "not-needed"),
+    base_url=os.getenv("OPENAI_BASE_URL") or os.getenv("ANTHROPIC_BASE_URL"),
+)
+MODEL = os.environ["MODEL_ID"]
+# if os.getenv("ANTHROPIC_BASE_URL"):
+#     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
+# client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+# MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain."
 
@@ -100,35 +107,138 @@ TOOL_HANDLERS = {
 }
 
 TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Run a shell command.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"}
+                },
+                "required": ["command"]
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read file contents.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "limit": {"type": "integer"}
+                },
+                "required": ["path"]
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write content to file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["path", "content"]
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Replace exact text in file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_text": {"type": "string"},
+                    "new_text": {"type": "string"}
+                },
+                "required": ["path", "old_text", "new_text"]
+            },
+        },
+    },
 ]
 
 
-def agent_loop(messages: list):
+# def agent_loop(messages: list):
+#     while True:
+#         response = client.messages.create(
+#             model=MODEL, system=SYSTEM, messages=messages,
+#             tools=TOOLS, max_tokens=8000,
+#         )
+#         messages.append({"role": "assistant", "content": response.content})
+#         if response.stop_reason != "tool_use":
+#             return
+#         results = []
+#         for block in response.content:
+#             if block.type == "tool_use":
+#                 handler = TOOL_HANDLERS.get(block.name)
+#                 output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+#                 print(f"> {block.name}: {output[:200]}")
+#                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
+#         messages.append({"role": "user", "content": results})
+def agent_loop(messages: list) -> str:
     while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "system", "content": SYSTEM}, *messages],
+            tools=TOOLS,
+            tool_choice="auto",
         )
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
-            return
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                print(f"> {block.name}: {output[:200]}")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
-        messages.append({"role": "user", "content": results})
+        message = response.choices[0].message
 
+        assistant_message = {
+            "role": "assistant",
+            "content": message.content or "",
+        }
+        if message.tool_calls:
+            assistant_message["tool_calls"] = [
+                {
+                    "id": tool_call.id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_call.function.name,
+                        "arguments": tool_call.function.arguments,
+                    },
+                }
+                for tool_call in message.tool_calls
+            ]
+        messages.append(assistant_message)
+
+        if not message.tool_calls:
+            return message.content or ""
+
+        tool_messages = []
+        for tool_call in message.tool_calls:
+            try:
+                args = json.loads(tool_call.function.arguments or "{}")
+            except json.JSONDecodeError as exc:
+                output = f"Error: Invalid tool arguments: {exc}"
+            else:
+                # command = args.get("command", "")
+                # print(f"\033[33m$ {command}\033[0m")
+                # output = run_bash(command)
+                # print(output[:200])
+                handler = TOOL_HANDLERS.get(tool_call.function.name)
+                output = handler(**args) if handler else f"Unknown tool: {tool_call.function.name}"
+                print(f"> {tool_call.function.name}: {output[:200]}")
+
+            tool_messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": output,
+            })
+        messages.extend(tool_messages)
 
 if __name__ == "__main__":
     history = []

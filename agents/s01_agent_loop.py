@@ -139,3 +139,21 @@ if __name__ == "__main__":
         if final_text:
             print(final_text)
         print()
+
+def agent_loop(messages: list):
+    while True:
+        response = client.messages.create(
+            model=MODEL, system=SYSTEM, messages=messages,
+            tools=TOOLS, max_tokens=8000,
+        )
+        messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use":
+            return
+        results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                handler = TOOL_HANDLERS.get(block.name)
+                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                print(f"> {block.name}: {output[:200]}")
+                results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
+        messages.append({"role": "user", "content": results})
